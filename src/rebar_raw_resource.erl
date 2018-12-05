@@ -44,6 +44,12 @@
     needs_update/2
 ]).
 
+-export([
+         init/2,
+         download/4,
+         make_vsn/2
+]).
+
 % For development only - you *really* don't want this defined!
 %-define(RRR_DEBUG,  true).
 
@@ -254,6 +260,7 @@ download(Dest, {?RTYPE, Spec, Opts}, State) ->
             Err
     end.
 
+
 -spec lock(Path :: rsrc_dir(), Spec :: this_spec())
         -> rebar_lock() | no_return().
 %
@@ -261,15 +268,31 @@ download(Dest, {?RTYPE, Spec, Opts}, State) ->
 % Note that the callback doesn't allow an error tuple to be returned, so an
 % exception is our only option if we can't look up the mapping.
 %
-lock(Path, {?RTYPE, Loc, #mod_ref{res = Res, ref = Prev} = Rec}) ->
+
+
+%% pre-rebar3 3.7.0 format
+lock(Path, Source) when not(erlang:is_tuple(Path)) ->
+    lock_(Path, Source);
+%% rebar_resource_v2 format
+lock(AppInfo, _ResourceState) ->
+    Spec =
+        case rebar_app_info:source(AppInfo) of
+            {?RTYPE, S, _} -> S;
+            {?RTYPE, S} -> S
+        end,
+    {Res, _Loc} = parse_ext_spec(Spec),
+    #mod_res{mod = Mod} = lookup_res(mod_data(), Res),
+    Mod:lock(rebar_app_info:source(AppInfo, Spec), []).
+
+lock_(Path, {?RTYPE, Loc, #mod_ref{res = Res, ref = Prev} = Rec}) ->
     #mod_res{mod = Mod} = lookup_res(mod_data(), Res),
     {Res, Loc, Ref} = Mod:lock(Path, {Res, Loc, Prev}),
     {?RTYPE, Loc, Rec#mod_ref{ref = Ref}};
 
-lock(Path, {?RTYPE, Spec}) ->
+lock_(Path, {?RTYPE, Spec}) ->
     lock(Path, {?RTYPE, Spec, []});
 
-lock(Path, {?RTYPE, Spec, Opts}) ->
+lock_(Path, {?RTYPE, Spec, Opts}) ->
     {Res, _} = parse_ext_spec(Spec),
     #mod_res{mod = Mod} = lookup_res(mod_data(), Res),
     {Res, Loc, Ref} = Mod:lock(Path, Spec),
@@ -282,14 +305,28 @@ lock(Path, {?RTYPE, Spec, Opts}) ->
 % Note that the callback doesn't allow an error tuple to be returned, so an
 % exception is our only option if we can't look up the mapping.
 %
-needs_update(Path, {?RTYPE, Loc, #mod_ref{res = Res, ref = Ref}}) ->
+
+needs_update(Dir, {_Type, _Path, _Ref} = Spec) ->
+    needs_update_(Dir, Spec);
+%% rebar_resource_v2 compatible format
+needs_update(AppInfo, _ResourceState) ->
+    Spec =
+        case rebar_app_info:source(AppInfo) of
+            {?RTYPE, S, _} -> S;
+            {?RTYPE, S} -> S
+        end,
+    {Res, _Loc} = parse_ext_spec(Spec),
+    #mod_res{mod = Mod} = lookup_res(mod_data(), Res),
+    Mod:needs_update(rebar_app_info:source(AppInfo, Spec), []).
+
+needs_update_(Path, {?RTYPE, Loc, #mod_ref{res = Res, ref = Ref}}) ->
     #mod_res{mod = Mod} = lookup_res(mod_data(), Res),
     Mod:needs_update(Path, {Res, Loc, Ref});
 
-needs_update(Path, {?RTYPE, Spec, _}) ->
+needs_update_(Path, {?RTYPE, Spec, _}) ->
     needs_update(Path, {?RTYPE, Spec});
 
-needs_update(Path, {?RTYPE, Spec}) ->
+needs_update_(Path, {?RTYPE, Spec}) ->
     {Res, _} = parse_ext_spec(Spec),
     #mod_res{mod = Mod} = lookup_res(mod_data(), Res),
     Mod:needs_update(Path, Spec).
@@ -390,6 +427,14 @@ absorb_profiles(Data, [], _) ->
 %
 % Allow for whatever may come through to handle future extensions.
 %
+% rebar v2 resource
+absorb_resources(Data, [Res | Resources]) when ?is_rec_type(Res, resource, 3) ->
+    absorb_resources(
+        map_res(Data, #mod_res{
+            res = term_to_atom(erlang:element(2, Res)),
+            mod = erlang:element(3, Res)}),
+        Resources);
+% old style rebar resource
 absorb_resources(Data, [Res | Resources]) when ?is_min_tuple(Res, 2) ->
     absorb_resources(
         map_res(Data, #mod_res{
@@ -472,9 +517,9 @@ ensure_app(Path, Mod, Name, Opts, Result) ->
                 "    {applications,  [kernel, stdlib]}\n"
                 "]}.\n",
                 [?MODULE, Name, Desc, Vsn]),
-            case filelib:ensure_dir(BApp) of
+            case filelib:ensure_dir(SApp) of
                 'ok' ->
-                    case file:write_file(BApp, Data) of
+                    case file:write_file(SApp, Data) of
                         'ok' ->
                             Result;
                         Err ->
@@ -630,6 +675,44 @@ lookup_res(#mod_data{rsrcs = Rsrcs} = Data, Res) ->
             format_error('rebar_api', 'error', Class, Res),
             _ = dump_mod_data(Data),
             ?throw_error({Class, Res})
+    end.
+
+-spec init(Type :: atom(), State :: rebar_state:t()) ->
+                  {ok, Resources :: term()}.
+init(Type, State) ->
+    #mod_data{} = absorb_state(State),
+    {ok, rebar_resource_v2:new(Type, ?MODULE, #{})}.
+
+make_vsn(AppInfo0, _ResourceState) ->
+    Spec =
+        case rebar_app_info:source(AppInfo0) of
+            {?RTYPE, S, _} -> S;
+            {?RTYPE, S} -> S
+        end,
+    {Res, _Loc} = parse_ext_spec(Spec),
+    #mod_res{mod = Mod} = lookup_res(mod_data(), Res),
+    Mod:make_vsn(rebar_app_info:source(AppInfo0, Spec), []).
+
+download(Dest, AppInfo0, ResourceState, RebarState) ->
+     {Spec, Opts} =
+        case rebar_app_info:source(AppInfo0) of
+            {?RTYPE, S, O} -> {S, O};
+            {?RTYPE, S} -> {S, []}
+        end,
+    {Res, Loc} = parse_ext_spec(Spec),
+    #mod_dep{name = Name} = lookup_loc(mod_data(), Loc),
+    #mod_res{mod = Mod} = lookup_res(mod_data(), Res),
+    AppInfo = rebar_app_info:source(AppInfo0, Spec),
+    case Mod:download(Dest, AppInfo, ResourceState, RebarState) of
+        ok ->
+            case lists:keytake(vsn, 1, Opts) of
+                false ->
+                    {plain, Vsn} = Mod:make_vsn(AppInfo, []),
+                    ensure_app(Dest, Mod, Name, [{vsn, Vsn} |Opts], ok);
+                {value, _, _} ->
+                    ensure_app(Dest, Mod, Name, Opts, ok)
+                end;
+        Err -> Err
     end.
 
 %
